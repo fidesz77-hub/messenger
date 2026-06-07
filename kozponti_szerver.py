@@ -1,19 +1,21 @@
-import socket
-import threading
+import asyncio
 import os
 import random
 import smtplib
+import json
 from email.mime.text import MIMEText
+import websockets
 
-HOST = '0.0.0.0'
-PORT = 55555
+# A Render automatikusan ad egy PORT környezeti változót, ezt kötelező beolvasni!
+PORT = int(os.environ.get("PORT", 55555))
+HOST = "0.0.0.0"
 
-# === VALÓDI E-MAIL KÜLDÉS (A te adataid) ===
+# === GMAIL BEÁLLÍTÁSOK ===
 KULDO_EMAIL = "fidesz77@gmail.com"
-GMAIL_APP_JELSZO = "wplu xhbm vlqt nezs" # Ide jön a 16 betűs app jelszavad!
+GMAIL_APP_JELSZO = "wplu xhbm vlqt nezs"
 
+# Az online klienseket most egy szótárban tároljuk: websocket_objektum -> felhasználónév
 kliensek = {} 
-kapcsolatok_forditva = {} 
 ideiglenes_kodok = {} 
 JELSZO_FAJL = "felhasznalok.txt"
 
@@ -45,32 +47,30 @@ def email_kuldes(hova, kod):
             szerver.send_message(msg)
         print(f"[E-MAIL] Elküldve ide: {hova}")
     except Exception as e:
-        print(f"[E-MAIL HIBA] Konzolos kód: {kod} (Hiba: {e})")
+        print(f"[E-MAIL HIBA] Hiba történt: {e}")
 
-def online_lista_szetkuldes():
+async def online_lista_szetkuldes():
     nevek = ",".join(kliensek.values())
-    for kapcsolat in kliensek.keys():
-        try:
-            kapcsolat.sendall(f"ONLINE_LISTA|{nevek}\n".encode('utf-8'))
-        except: pass
+    if kliensek:
+        # Minden online embernek elküldjük az új listát
+        uzenet = f"ONLINE_LISTA|{nevek}\n"
+        await asyncio.gather(*[ws.send(uzenet) for ws in kliensek.keys()], return_exceptions=True)
 
-def uzenet_szetkuldes(uzenet_szoveg):
-    for kapcsolat in kliensek.keys():
-        try:
-            kapcsolat.sendall(f"GLOBAL|{uzenet_szoveg}\n".encode('utf-8'))
-        except: pass
+async def uzenet_szetkuldes(uzenet_szoveg):
+    if kliensek:
+        uzenet = f"GLOBAL|{uzenet_szoveg}\n"
+        await asyncio.gather(*[ws.send(uzenet) for ws in kliensek.keys()], return_exceptions=True)
 
-def kliens_kezeles(kapcsolat, cim):
-    bejelentkezo_fazis = True
+async def kliens_kezeles(websocket):
     nev = ""
-    maradek = ""
-
+    kliensek[websocket] = "" # Ideiglenesen regisztráljuk a kapcsolatot
+    
     try:
-        while bejelentkezo_fazis:
-            adat = kapcsolat.recv(1024).decode('utf-8')
-            if not adat: return
-            
+        async for adat in websocket:
             reszek = adat.strip().split("|")
+            if not reszek or not reszek[0]:
+                continue
+                
             parancs = reszek[0]
             regisztralt_fiokok = felhasznalok_betoltese()
 
@@ -78,84 +78,77 @@ def kliens_kezeles(kapcsolat, cim):
                 email = reszek[1]
                 kod = str(random.randint(100000, 999999))
                 ideiglenes_kodok[email] = kod
-                threading.Thread(target=email_kuldes, args=(email, kod), daemon=True).start()
-                kapcsolat.sendall("OK|Kód elküldve!\n".encode('utf-8'))
+                # Az e-mail küldést külön szálon futtatjuk, hogy ne akassza meg a szervert
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(None, email_kuldes, email, kod)
+                await websocket.send("OK|Kód elküldve!\n")
 
             elif parancs == "REGISZTRACIO":
                 u, p, e, k = reszek[1], reszek[2], reszek[3], reszek[4]
                 if u in regisztralt_fiokok:
-                    kapcsolat.sendall("HIBA|A név foglalt!\n".encode('utf-8'))
+                    await websocket.send("HIBA|A név foglalt!\n")
                 elif ideiglenes_kodok.get(e) != k:
-                    kapcsolat.sendall("HIBA|Hibás kód!\n".encode('utf-8'))
+                    await websocket.send("HIBA|Hibás kód!\n")
                 else:
                     regisztralt_fiokok[u] = {"jelszo": p, "email": e}
                     felhasznalok_mentese_mind(regisztralt_fiokok)
-                    kapcsolat.sendall("OK|Sikeres!\n".encode('utf-8'))
+                    await websocket.send("OK|Sikeres!\n")
 
             elif parancs == "BEJELENTKEZES":
                 u, p = reszek[1], reszek[2]
                 if u in regisztralt_fiokok and regisztralt_fiokok[u]["jelszo"] == p:
                     if u in kliensek.values():
-                        kapcsolat.sendall("HIBA|Már online!\n".encode('utf-8'))
+                        await websocket.send("HIBA|Már online!\n")
                     else:
-                        kapcsolat.sendall("OK|Sikeres\n".encode('utf-8'))
-                        bejelentkezo_fazis = False
+                        await websocket.send("OK|Sikeres\n")
                         nev = u
-                        kliensek[kapcsolat] = nev
-                        kapcsolatok_forditva[nev] = kapcsolat
+                        kliensek[websocket] = nev
                         print(f"[BELÉPETT] {nev}")
-                        online_lista_szetkuldes()
-                        uzenet_szetkuldes(f"[RENDSZER] {nev} csatlakozott.")
+                        await online_lista_szetkuldes()
+                        await uzenet_szetkuldes(f"[RENDSZER] {nev} csatlakozott.")
                 else:
-                    kapcsolat.sendall("HIBA|Hibás adatok!\n".encode('utf-8'))
+                    await websocket.send("HIBA|Hibás adatok!\n")
 
             elif parancs == "TORLES":
                 u, p = reszek[1], reszek[2]
                 if u in regisztralt_fiokok and regisztralt_fiokok[u]["jelszo"] == p:
                     del regisztralt_fiokok[u]
                     felhasznalok_mentese_mind(regisztralt_fiokok)
-                    kapcsolat.sendall("OK|Fiók törölve!\n".encode('utf-8'))
+                    await websocket.send("OK|Fiók törölve!\n")
                 else:
-                    kapcsolat.sendall("HIBA|Hibás adatok!\n".encode('utf-8'))
+                    await websocket.send("HIBA|Hibás adatok!\n")
 
-        # --- CHAT FÁZIS ---
-        while True:
-            adat = kapcsolat.recv(1024)
-            if not adat: break
+            elif parancs == "PRIVAT":
+                if len(reszek) >= 3:
+                    _, ki_kapja, tiszta_uzi = reszek[0], reszek[1], reszek[2]
+                    # Keresük meg a célszemély websocket kapcsolatát
+                    for ws, n in kliensek.items():
+                        if n == ki_kapja:
+                            await ws.send(f"PRIVAT|{nev}|{tiszta_uzi}\n")
+                            break
+                    await websocket.send(f"PRIVAT|{ki_kapja}|{tiszta_uzi}\n")
             
-            maradek += adat.decode('utf-8')
-            while "\n" in maradek:
-                sor, maradek = maradek.split("\n", 1)
-                if not sor: continue
-                
-                if sor.startswith("PRIVAT|"):
-                    _, ki_kapja, tiszta_uzi = sor.split("|", 2)
-                    if ki_kapja in kapcsolatok_forditva:
-                        kapcsolatok_forditva[ki_kapja].sendall(f"PRIVAT|{nev}|{tiszta_uzi}\n".encode('utf-8'))
-                        kapcsolat.sendall(f"PRIVAT|{ki_kapja}|{tiszta_uzi}\n".encode('utf-8'))
-                else:
-                    print(f"[GLOBAL] {nev}: {sor}")
-                    uzenet_szetkuldes(f"[{nev}]: {sor}")
+            elif nev: # Ha nincs parancs, de be van jelentkezve, akkor az GLOBAL üzenet
+                print(f"[GLOBAL] {nev}: {adat}")
+                await uzenet_szetkuldes(f"[{nev}]: {adat}")
 
-    except: pass
+    except Exception as e:
+        print(f"[HIBA] {e}")
     finally:
-        if kapcsolat in kliensek:
-            print(f"[KILÉPETT] {nev}")
-            del kliensek[kapcsolat]
-            if nev in kapcsolatok_forditva: del kapcsolatok_forditva[nev]
-            online_lista_szetkuldes()
-            uzenet_szetkuldes(f"[RENDSZER] {nev} kilépett.")
-        try: kapcsolat.close()
-        except: pass
+        if websocket in kliensek:
+            old_nev = kliensek[websocket]
+            del kliensek[websocket]
+            if old_nev:
+                print(f"[KILÉPETT] {old_nev}")
+                await online_lista_szetkuldes()
+                await uzenet_szetkuldes(f"[RENDSZER] {old_nev} kilépett.")
+
+async def main():
+    print("==================================================")
+    print(f" RENDER WEBSOCKET SZERVER INDUL PORTON: {PORT}  ")
+    print("==================================================")
+    async with websockets.serve(kliens_kezeles, HOST, PORT):
+        await asyncio.Future() # keep-alive folyamatos futás
 
 if __name__ == "__main__":
-    szerver = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    szerver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    szerver.bind((HOST, PORT))
-    szerver.listen()
-    print("==================================================")
-    print(" SZERVER FUT - PRIVÁT CHAT + KERESŐ AKTIVÁLVA     ")
-    print("==================================================")
-    while True:
-        kapcs, cim = szerver.accept()
-        threading.Thread(target=kliens_kezeles, args=(kapcs, cim), daemon=True).start()
+    asyncio.run(main())
