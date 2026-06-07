@@ -7,7 +7,7 @@ import urllib.request
 import sys
 import os
 
-SZERVER_IP = "127.0.0.1" 
+SZERVER_IP = "192.168.2.103" 
 PORT = 55555
 AKTUALIS_VERZIO = "4.1"  # Beállítva fixen 4.1-re!
 
